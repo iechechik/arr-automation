@@ -1,0 +1,24 @@
+# Логи скриптов импорта (пишутся в смонтированный /config/scripts)
+log
+log.1
+
+# Ключи привязки телевизоров LG (webOS) — секрет, у каждого свой
+tv_key/
+tv_client_key.json
+
+# Рабочий мусор
+*.bak
+*.pyc
+__pycache__/
+.DS_Store
+
+# Прокси RU-метаданных: кэши и локальные секреты (в репозитории им не место)
+tmdb_cache.json
+radarr_cache.json
+llm_cache.json
+cached_images/
+cert.pem
+key.pem
+ca-bundle.crt
+proxy.py-nocach
+.git/

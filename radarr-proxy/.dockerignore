@@ -1,0 +1,7 @@
+cached_images/
+radarr_cache.json
+proxy.py-nocach
+*.log
+__pycache__/
+*.pyc
+.git/

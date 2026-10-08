@@ -1,0 +1,7 @@
+cached_images/
+tmdb_cache.json
+*.log
+__pycache__/
+*.pyc
+.git/
+.gitignore

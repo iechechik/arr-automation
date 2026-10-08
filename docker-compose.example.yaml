@@ -1,0 +1,193 @@
+# Пример для docker-compose (вырезка из рабочего compose, лишние сервисы убраны).
+# Ключи заменены на xxxxxxxx — подставьте свои.
+#
+# Что из этого нужно для чего:
+#   radarr/sonarr  — собственно приложения; монтируют common-scripts как /config/scripts,
+#                    потому что оттуда их дёргает хук ManualInteractionRequired
+#   jelly-arr-reaper  — вебхук от Jellyfin: удалил в Jellyfin → вычистилось из *arr и с диска
+#   tv_jelly_launcher — включил телевизор → на нём сам запускается Jellyfin
+#
+# Блоки links + ca-bundle у radarr/sonarr относятся к другому проекту (RU-метаданные
+# через свои прокси). Если прокси не используете — эти строки просто уберите.
+
+services:
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    ports:
+      - "9094:7878"
+    volumes:
+      - /opt/docker-compose/configs/radarr:/config
+      - /mnt/data:/mnt/data
+      - /opt/docker-compose/common-scripts:/config/scripts
+      - /etc/gai.conf:/etc/gai.conf:ro
+      # --- только для RU-прокси (см. комментарий в шапке) ---
+      - /opt/docker-compose/configs/radarr-proxy/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    links:
+      - "radarr-proxy:api.radarr.video"
+      - "radarr-proxy:radarr.servarr.com"
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Europe/Moscow
+    networks:
+      - dockernet
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    ports:
+      - "9095:8989"
+    volumes:
+      - /opt/docker-compose/configs/sonarr:/config
+      - /mnt/data:/mnt/data
+      - /opt/docker-compose/common-scripts:/config/scripts
+      - /etc/gai.conf:/etc/gai.conf:ro
+      # --- только для RU-прокси (см. комментарий в шапке) ---
+      - /opt/docker-compose/configs/sonarr-proxy/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    links:
+      - "sonarr-proxy:skyhook.sonarr.tv"
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Europe/Moscow
+    networks:
+      - dockernet
+
+  # Jellyfin: удалили фильм/сериал из медиатеки -> вебхук сюда -> удаление из *arr
+  # с файлами. Наружу порт не публикуется: обращается только Jellyfin по docker-сети.
+  jelly-arr-reaper:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    build: /opt/docker-compose/configs/jelly-arr-reaper
+    container_name: jelly-arr-reaper
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    volumes:
+      - /opt/docker-compose/configs/jelly-arr-reaper:/app
+    environment:
+      - TZ=Europe/Moscow
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - DELETE_FILES=true          # false — удалять только из *arr, файлы на диске оставить
+    networks:
+      - dockernet
+
+  # Телевизоры LG (webOS): пингует, и при включении поднимает на нём приложение Jellyfin.
+  # network_mode: host нужен, чтобы пинги и websocket до телевизоров шли из домашней сети.
+  tv_jelly_launcher:
+    container_name: tv_jelly_launcher
+    build: /opt/docker-compose/configs/tv_jelly_launcher
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Europe/Moscow
+      - TVS=кухня=192.168.1.32,спальня=192.168.1.30   # имя=адрес, через запятую
+      - PING_INTERVAL=4                              # период опроса, секунды
+      # - DEBUG_PING=true                            # подробный лог пингов
+      # - JELLYFIN_MATCH=jellyfin                    # чем искать приложение в списке ТВ
+    volumes:
+      - /opt/docker-compose/configs/tv_jelly_launcher:/app
+      - /opt/docker-compose/configs/tv_jelly_launcher/tv_key:/app/tv_key
+
+  # ─── Прокси RU-метаданных ──────────────────────────────────────────────────
+  # Sonarr/Radarr ходят за метадатой не на skyhook/api.radarr.video напрямую, а в эти
+  # контейнеры (см. links у radarr/sonarr выше): прокси переводит названия/описания на
+  # русский через TMDb, подменяет постеры (свой кэш картинок) и, если включён ENABLE_LLM,
+  # спрашивает LLM оригинальные названия по русскому запросу.
+  # Общий для обоих код — arr_common.py, монтируется read-only в /common.
+  # cert.pem/key.pem — самоподписанный сертификат на имя проксируемого хоста,
+  # ca-bundle.crt — системные корни + этот сертификат. В репозитории их нет (секрет/блоб),
+  # делаются на месте (см. README).
+
+  sonarr-proxy:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    build: /opt/docker-compose/configs/sonarr-proxy
+    container_name: sonarr-proxy
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    volumes:
+      - /opt/docker-compose/configs/sonarr-proxy:/app
+      - /opt/docker-compose/configs/common-arr-proxy:/common:ro
+      - /etc/gai.conf:/etc/gai.conf:ro
+    environment:
+      - TZ=Europe/Moscow
+      - TMDB_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # бесплатный ключ: themoviedb.org -> Settings -> API
+      - DEBUG_LEVEL=2              # 1 — кратко, 2 — подробно, 0 — тихо
+      - ENABLE_LLM=true            # спрашивать LLM оригинальные названия
+      - LLM_URL=http://freellmapi:3001/v1/chat/completions
+      - LLM_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - LLM_TIMEOUT=5.0
+      - LLM_MAX_VARIANTS=3
+    networks:
+      - dockernet
+
+  radarr-proxy:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    build: /opt/docker-compose/configs/radarr-proxy
+    container_name: radarr-proxy
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    volumes:
+      - /opt/docker-compose/configs/radarr-proxy:/app
+      - /opt/docker-compose/configs/common-arr-proxy:/common:ro
+      - /etc/gai.conf:/etc/gai.conf:ro
+    environment:
+      - TZ=Europe/Moscow
+      - TMDB_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # бесплатный ключ: themoviedb.org -> Settings -> API
+      - DEBUG_LEVEL=2
+      - ENABLE_LLM=true
+      - LLM_URL=http://freellmapi:3001/v1/chat/completions
+      - LLM_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - LLM_TIMEOUT=5.0
+      - LLM_MAX_VARIANTS=3
+    networks:
+      - dockernet
+
+  prowlarr-proxy:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    build: /opt/docker-compose/configs/prowlarr-proxy
+    container_name: prowlarr-proxy
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    volumes:
+      - /opt/docker-compose/configs/prowlarr-proxy:/app
+      - /opt/docker-compose/configs/common-arr-proxy:/common:ro
+      - /etc/gai.conf:/etc/gai.conf:ro
+    environment:
+      - TZ=Europe/Moscow
+      - PROWLARR_URL=http://prowlarr:9696
+      - PROWLARR_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - LISTEN_PORT=9696
+      - SKIP_CATEGORIES=5070,5030,5040   # категории, которые выкидываем из выдачи поиска
+      - DEBUG=true
+    networks:
+      - dockernet
+
+networks:
+  dockernet:
+    name: dockernet
