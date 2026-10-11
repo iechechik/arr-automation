@@ -1,3 +1,4 @@
+
 # arr-automation
 
 Мелкая автоматика вокруг связки **Sonarr / Radarr / Jellyfin / qBittorrent**, которая
@@ -150,6 +151,48 @@ Sonarr и Radarr ищут по оригинальным названиям: на
 
 Для обогащения нужен ключ TMDb — передаётся переменной окружения `TMDB_API_KEY`
 (берётся бесплатно: themoviedb.org → Settings → API). В коде его нет.
+
+### Кастомное определение RuTor для Prowlarr
+
+В `prowlarr-proxy/` лежит `rutor-custom.yml` — кастомный индексатор RuTor для Prowlarr.
+Встроенный RuTor-индексатор не подходит по двум причинам:
+
+- он ищет по IMDb (`imdbid` в `modes.tv-search`), а RuTor по IMDb не отвечает —
+  Sonarr получает пустую выдачу;
+- он не срезает `S06E04` / `S06` из конца поискового запроса, а RuTor ищет **точное
+  вхождение подстроки** и не находит `S06E04` в названиях пакетов (`[S06E01-04 of 06]`).
+
+Кастом решает обе проблемы: убирает `imdbid` из `modes` и добавляет `keywordsfilters`,
+срезающие хвост `SxxExx` из ключевого слова перед отправкой в RuTor.
+
+**Установка:**
+
+1. Скопировать файл в Prowlarr:
+
+   ```bash
+   cp prowlarr-proxy/rutor-custom.yml \
+      /opt/docker-compose/configs/prowlarr/Definitions/Custom/
+   docker restart prowlarr
+   ```
+
+   Либо смонтировать read-only в `docker-compose.yaml`:
+
+   ```yaml
+   prowlarr:
+     volumes:
+       - ./prowlarr-proxy/rutor-custom.yml:/config/Definitions/Custom/rutor-custom.yml:ro
+   ```
+
+2. В UI Prowlarr: **Indexers → Add Indexer → RuTor (Custom)** → добавить,
+   включить, Save, Test — должен стать зелёным.
+
+3. В **Apps → Sonarr → Sync**, чтобы Sonarr подхватил новый индексатор.
+
+Кастом **работает вместе** с `prowlarr-proxy`, а не вместо него. Прокси нормализует
+имена релизов (`перевод / оригинал / SxxExx ...`) для Sonarr, Kinozal, NoNaMe и
+RuTor, а кастом заставляет RuTor вообще отвечать на запросы. Без прокси Sonarr
+снова начнёт ругаться `Unknown Series` на релизах Kinozal и NoNaMe, потому что их
+формат (`Медленные лошади (Хромые кони) Slow Horses ...`) Sonarr не понимает.
 
 ### Сертификаты и бандл
 
