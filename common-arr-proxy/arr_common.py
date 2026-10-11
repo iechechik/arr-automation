@@ -483,7 +483,7 @@ async def llm_resolve_term(session, cfg, term, cache):
         return variants
 
     payload = {
-        "model": cfg.get("model", "deepseek-chat"),
+        "model": cfg.get("model", "auto"),
         "messages": [{"role": "user", "content": cfg["prompt"].format(term=term)}],
         "temperature": 0.2,
         "stop": ["\n\n"],

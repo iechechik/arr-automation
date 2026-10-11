@@ -121,7 +121,7 @@ LLM_CFG = {
     "timeout":       LLM_TIMEOUT,
     "max_variants":  LLM_MAX_VARIANTS,
     "prompt":        LLM_PROMPT,
-    "model":         "deepseek-chat",
+    "model":         "auto",
     "plus_to_space": False,
 }
 
