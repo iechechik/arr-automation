@@ -160,6 +160,7 @@ def normalize_title(title: str) -> str:
             head = title[:m2.start()].strip()
             tail = title[m2.start():].strip()
         else:
+            head = re.sub(r'[\s\-–—|]+$', '', head)   # убрать " -" перед маркером
             # Чистый фильм: переводим всю строку
             translation, original = split_names(title)
             if translation and original:
@@ -184,7 +185,11 @@ def normalize_title(title: str) -> str:
     result = normalize_marker(result)
     # Вставить " / " между латинским оригиналом и маркером SxxExx
     # "Slow Horses S6E1-4 of 6" -> "Slow Horses / S6E1-4 of 6"
-    result = re.sub(r'([A-Za-z])\s+(S\d{1,3}E\d{1,3})', r'\1 / \2', result)
+    result = re.sub(r'([A-Za-z])\s*(?:[-–—]\s*)?(S\d{1,3}E\d{1,3})', r'\1 / \2', result)
+    
+    # Kinozal: " - 2026 MVO" -> " [2026] MVO" (иначе Sonarr ломается на дефисе перед годом)
+    result = re.sub(r'\s+-\s+(\d{4})(?=\s|$)', r' [\1]', result)
+    
     return re.sub(r'\s+', ' ', result).strip()
 
 
