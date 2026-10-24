@@ -20,6 +20,13 @@ DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 SKIP_CATEGORIES = os.environ.get("SKIP_CATEGORIES", "5070,5030,5040").split(",")
 SKIP_CATEGORIES = [c.strip() for c in SKIP_CATEGORIES if c.strip()]
 
+# Sonarr: нужен только для сезонного поиска — узнать, какие серии уже есть.
+# Адрес и ключ приходят из окружения контейнера (compose). Нет ключа —
+# сезонное сужение просто выключается, прокси работает как раньше.
+SONARR_URL = os.environ.get("SONARR_URL", "http://sonarr:8989").rstrip("/")
+SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
+SONARR_CACHE_TTL = int(os.environ.get("SONARR_CACHE_TTL", "120"))
+
 http_session = None
 
 if not PROWLARR_API_KEY:
@@ -69,10 +76,16 @@ SEASON_EPISODE_RU_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NEW: диапазон S{season}E{a}-{b} (of N) — для схлопывания под запрошенный ep
+RANGE_FOR_EP_RE = re.compile(
+    r'(?P<prefix>S)(?P<season>\d{1,3})E(?P<a>\d{1,3})[-\u2013](?P<b>\d{1,3})'
+    r'(?:\s+of\s+\d{1,3})?',
+    re.IGNORECASE,
+)
+
 
 def normalize_marker(title: str) -> str:
     """Приводит маркеры сезона/эпизода к SNE-формату."""
-    # (сезон 6, серии 1-4 из 6) -> S6E1-4 of 6
     def repl_ru(m):
         s = m.group(1)
         e1 = m.group(2)
@@ -85,11 +98,9 @@ def normalize_marker(title: str) -> str:
         return f'S{int(s)}'
     title = SEASON_EPISODE_RU_RE.sub(repl_ru, title)
 
-    # [S06E01-04 of 06] -> S6E1-4 of 6
     def repl_br(m):
         s = m.group(1)
         rest = m.group(2) or ''
-        # нормализуем E01-04 of 06
         rest = re.sub(r'^E0*(\d+)', lambda x: f'E{int(x.group(1))}', rest)
         rest = re.sub(r'-0*(\d+)', lambda x: f'-{int(x.group(1))}', rest)
         rest = re.sub(r'\s+of\s+0*(\d+)', lambda x: f' of {int(x.group(1))}', rest)
@@ -100,10 +111,8 @@ def normalize_marker(title: str) -> str:
         repl_br, title, flags=re.IGNORECASE,
     )
 
-    # [S05] -> S5
     title = SEASON_ONLY_BRACKET_RE.sub(lambda m: f'S{int(m.group(1))}', title)
 
-    # S06E01-04 of 06 (без скобок) -> S6E1-4 of 6
     def repl_inline(m):
         t = m.group(0)
         t = re.sub(r'^[Ss]0*(\d+)', lambda x: f'S{int(x.group(1))}', t)
@@ -117,19 +126,8 @@ def normalize_marker(title: str) -> str:
 
 
 def split_names(head: str):
-    """
-    Разбирает голову (до маркера) на перевод / оригинал.
-    Возвращает (translation, original).
-    - кириллица без скобок → перевод
-    - кириллица в скобках     → альтернатива (игнор)
-    - латиница                → оригинал
-    """
-    # Вставить / между кириллицей и латиницей, если их разделяет только пробел
-    # "Медленные лошади Slow Horses" -> "Медленные лошади / Slow Horses"
     head = re.sub(r'([\u0400-\u04FF])\s+([A-Za-z])', r'\1 / \2', head)
-    # Круглые скобки с кириллицей → заменить на слэш-разделитель
     head = re.sub(r'\(\s*([^)]*[\u0400-\u04FF][^)]*)\s*\)', r' / \1 / ', head)
-    # Одиночные слэши нормализуем
     head = re.sub(r'\s*/\s*', ' / ', head)
     parts = [p.strip() for p in head.split(' / ') if p.strip()]
 
@@ -147,21 +145,16 @@ def split_names(head: str):
 
 
 def normalize_title(title: str) -> str:
-    # 1. Если латиницы нет — не трогаем (оригинал на русском, типа "Оно (2017)")
     if not LAT_RE.search(title):
         return title
 
-    # 2. Найти маркер сезона/эпизода
     m = SEASON_EPISODE_INLINE_RE.search(title)
     if not m:
-        # Фильм или сезон без эпизода: [S05] или просто ничего
         m2 = re.search(r'\[\s*S\d{1,3}\s*\]', title)
         if m2:
             head = title[:m2.start()].strip()
             tail = title[m2.start():].strip()
         else:
-            head = re.sub(r'[\s\-–—|]+$', '', head)   # убрать " -" перед маркером
-            # Чистый фильм: переводим всю строку
             translation, original = split_names(title)
             if translation and original:
                 return f'{translation} / {original}'
@@ -183,23 +176,351 @@ def normalize_title(title: str) -> str:
 
     result = f'{head_out} {tail}' if head_out else tail
     result = normalize_marker(result)
-    # Вставить " / " между латинским оригиналом и маркером SxxExx
-    # "Slow Horses S6E1-4 of 6" -> "Slow Horses / S6E1-4 of 6"
     result = re.sub(r'([A-Za-z])\s*(?:[-–—]\s*)?(S\d{1,3}E\d{1,3})', r'\1 / \2', result)
-    
-    # Kinozal: " - 2026 MVO" -> " [2026] MVO" (иначе Sonarr ломается на дефисе перед годом)
     result = re.sub(r'\s+-\s+(\d{4})(?=\s|$)', r' [\1]', result)
-    
+
     return re.sub(r'\s+', ' ', result).strip()
 
 
-def replace_titles(root, mapping: dict) -> bytes:
+# NEW: схлопывание диапазона в одиночный эпизод под запрос
+def collapse_range_for_ep(title: str, season: int, ep: int):
+    """
+    Если заголовок содержит S{season}E{a}-{b} (of N) и a <= ep <= b,
+    заменяем на S{season}E{ep} (без "of N").
+    Возвращает (новый_заголовок, количество_эпизодов_в_паке) или (title, 0) если не менялось.
+    """
+    class State:
+        count = 0
+    state = State()
+
+    def repl_with_state(m):
+        s = int(m.group('season'))
+        a = int(m.group('a'))
+        b = int(m.group('b'))
+        if s == season and a <= ep <= b:
+            state.count = b - a + 1
+            return f'S{s}E{ep}'
+        return m.group(0)
+
+    new_title = RANGE_FOR_EP_RE.sub(repl_with_state, title)
+    return new_title, state.count
+
+
+def replace_titles_and_sizes(root, mapping: dict, size_divisors: dict) -> bytes:
+    """
+    Заменяет заголовки и, если нужно, делит размер во всех местах,
+    где Sonarr может его прочитать (size, enclosure, torznab:attr).
+    size_divisors: {старый_title: divisor}
+    """
     for item in root.iter("item"):
         title_el = item.find("title")
         if title_el is not None and title_el.text in mapping:
-            new_title = mapping[title_el.text]
-            if new_title != title_el.text:
+            old_title = title_el.text
+            new_title = mapping[old_title]
+            if new_title != old_title:
                 title_el.text = new_title
+
+                divisor = size_divisors.get(old_title, 0)
+                if divisor > 1:
+                    # 1) <size>
+                    size_el = item.find("size")
+                    if size_el is not None and size_el.text:
+                        try:
+                            old_size = int(size_el.text)
+                            new_size = old_size // divisor
+                            size_el.text = str(new_size)
+                            log(f"  [SIZE] size {old_size} -> {new_size}", level=0)
+                        except ValueError:
+                            pass
+
+                    # 2) <enclosure length="...">
+                    enc = item.find("enclosure")
+                    if enc is not None:
+                        old_len = enc.get("length")
+                        if old_len:
+                            try:
+                                new_len = int(old_len) // divisor
+                                enc.set("length", str(new_len))
+                                log(f"  [SIZE] enclosure {old_len} -> {new_len}", level=0)
+                            except ValueError:
+                                pass
+
+                    # 3) <torznab:attr name="size" value="...">
+                    for attr in item.findall("{http://torznab.com/schemas/2015/feed}attr"):
+                        if attr.get("name") == "size":
+                            old_val = attr.get("value")
+                            if old_val:
+                                try:
+                                    new_val = int(old_val) // divisor
+                                    attr.set("value", str(new_val))
+                                    log(f"  [SIZE] torznab:size {old_val} -> {new_val}", level=0)
+                                except ValueError:
+                                    pass
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+# ======================================================================
+# Сезонный поиск: пакет сужается до серий, которых нет в библиотеке
+# ======================================================================
+import copy
+import time
+import hashlib
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+
+_series_cache = {"ts": 0.0, "items": []}
+_eps_cache = {}
+
+EP_RANGE_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?P<s>\d{1,3})E(?P<a>\d{1,3})[-\u2013](?P<b>\d{1,3})'
+    r'(?:\s+of\s+\d{1,3})?', re.IGNORECASE)
+EP_MULTI_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?P<s>\d{1,3})(?P<eps>(?:E\d{1,3}){2,})'
+    r'(?:\s+of\s+\d{1,3})?', re.IGNORECASE)
+EP_SINGLE_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?P<s>\d{1,3})E(?P<a>\d{1,3})'
+    r'(?:\s+of\s+\d{1,3})?', re.IGNORECASE)
+EP_SEASON_ONLY_RE = re.compile(r'(?<![A-Za-z0-9])S(?P<s>\d{1,3})(?![\dEe])', re.IGNORECASE)
+
+
+async def sonarr_get(path, params=None):
+    if not SONARR_API_KEY:
+        return None
+    url = f"{SONARR_URL}/api/v3/{path}"
+    try:
+        async with http_session.get(
+            url, params=params,
+            headers={"X-Api-Key": SONARR_API_KEY},
+            timeout=ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                log(f"[SONARR] {path}: HTTP {resp.status}", level=0)
+                return None
+            return await resp.json()
+    except Exception as e:
+        log(f"[SONARR] {path}: {type(e).__name__}: {e}", level=0)
+        return None
+
+
+async def sonarr_series():
+    now = time.monotonic()
+    if _series_cache["items"] and now - _series_cache["ts"] < SONARR_CACHE_TTL:
+        return _series_cache["items"]
+    items = await sonarr_get("series")
+    if items:
+        _series_cache["ts"] = now
+        _series_cache["items"] = items
+    return _series_cache["items"]
+
+
+async def sonarr_episodes(series_id):
+    now = time.monotonic()
+    cached = _eps_cache.get(series_id)
+    if cached and now - cached[0] < SONARR_CACHE_TTL:
+        return cached[1]
+    items = await sonarr_get("episode", {"seriesId": series_id})
+    if items is not None:
+        _eps_cache[series_id] = (now, items)
+        return items
+    return cached[1] if cached else None
+
+
+def clean_name(value):
+    value = (value or "").lower().replace("\u0451", "\u0435")
+    value = re.sub(r"\(\s*\d{4}\s*\)", " ", value)
+    value = re.sub(r"\[\s*\d{4}\s*\]", " ", value)
+    value = re.sub(r"[^0-9a-z\u0430-\u044f]+", " ", value)
+    return " ".join(value.split())
+
+
+def series_names(series):
+    names = [series.get("title"), series.get("originalTitle")]
+    for alias in series.get("alternateTitles") or []:
+        names.append(alias.get("title"))
+    return [clean_name(n) for n in names if clean_name(n)]
+
+
+def match_series(query, series_list):
+    """Ищем сериал в Sonarr по строке q из запроса (fuzzy, порог 0.85)."""
+    q = clean_name(query)
+    if not q:
+        return None
+    best_score, best = 0.0, None
+    for series in series_list:
+        for name in series_names(series):
+            if name == q:
+                return series
+            score = SequenceMatcher(None, name, q).ratio()
+            if q.startswith(name) or name.startswith(q):
+                score = max(score, 0.9)
+            if score > best_score:
+                best_score, best = score, series
+    return best if best_score >= 0.85 else None
+
+
+def item_matches_series(title, series):
+    """Заголовок раздачи относится к этому сериалу? Сверяем куски до маркера."""
+    span = episode_span(title, None)
+    head = title[:span[0][0]] if span else title
+    parts = [clean_name(p) for p in re.split(r"/", head)]
+    parts = [p for p in parts if p]
+    parts.append(clean_name(head))
+    known = series_names(series)
+    for part in parts:
+        for name in known:
+            if part == name:
+                return True
+            if SequenceMatcher(None, part, name).ratio() >= 0.9:
+                return True
+    return False
+
+
+def aired(episode):
+    value = episode.get("airDateUtc") or ""
+    if not value:
+        return False
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return dt <= datetime.now(timezone.utc)
+
+
+def missing_in_season(episodes, season):
+    return {e["episodeNumber"] for e in episodes
+            if e.get("seasonNumber") == season and aired(e) and not e.get("hasFile")}
+
+
+def episode_span(title, season):
+    """(span, kind, номера) для маркера сезона/серий; season=None — любой сезон."""
+    m = EP_RANGE_RE.search(title)
+    if m and (season is None or int(m.group("s")) == season):
+        a, b = int(m.group("a")), int(m.group("b"))
+        if a <= b:
+            return m.span(), "range", list(range(a, b + 1))
+    m = EP_MULTI_RE.search(title)
+    if m and (season is None or int(m.group("s")) == season):
+        nums = [int(x) for x in re.findall(r"\d+", m.group("eps"))]
+        if nums:
+            return m.span(), "multi", list(range(min(nums), max(nums) + 1))
+    m = EP_SINGLE_RE.search(title)
+    if m and (season is None or int(m.group("s")) == season):
+        return m.span(), "single", [int(m.group("a"))]
+    return None
+
+
+def runs(numbers):
+    out = []
+    for n in numbers:
+        if out and n == out[-1][-1] + 1:
+            out[-1].append(n)
+        else:
+            out.append([n])
+    return out
+
+
+def run_marker(season, run):
+    return "S%d%s" % (season, "".join("E%d" % e for e in run))
+
+
+def scale_sizes(item, factor):
+    if factor == 1.0:
+        return
+    size_el = item.find("size")
+    if size_el is not None and size_el.text:
+        try:
+            size_el.text = str(int(int(size_el.text) * factor))
+        except ValueError:
+            pass
+    enc = item.find("enclosure")
+    if enc is not None and enc.get("length"):
+        try:
+            enc.set("length", str(int(int(enc.get("length")) * factor)))
+        except ValueError:
+            pass
+    for attr in item.findall("{http://torznab.com/schemas/2015/feed}attr"):
+        if attr.get("name") == "size" and attr.get("value"):
+            try:
+                attr.set("value", str(int(int(attr.get("value")) * factor)))
+            except ValueError:
+                pass
+
+
+def set_guid(item, base_guid, index):
+    guid_el = item.find("guid")
+    if guid_el is None:
+        guid_el = ET.SubElement(item, "guid")
+    guid_el.text = hashlib.md5(("%s_%d" % (base_guid, index)).encode()).hexdigest()
+    guid_el.set("isPermaLink", "false")
+
+
+def plan_item(title, season, need, series):
+    """
+    None  — не трогаем (нет маркера, другой сериал/сезон, или пакет нужен целиком)
+    []    — выбросить (нужных серий в пакете нет)
+    [ (заголовок, коэффициент_размера), ... ] — заменить на эти item'ы
+    """
+    base = title
+    if CYR_RE.search(title):
+        try:
+            base = normalize_title(title)
+        except Exception:
+            base = title
+    if not item_matches_series(base, series):
+        return None
+    span = episode_span(base, season)
+    if not span:
+        if EP_SEASON_ONLY_RE.search(base):
+            log(f"[SEASON] «сезон целиком», не трогаем: {base[:90]}", level=0)
+        return None
+    (start, end), kind, pack = span
+    wanted = sorted(set(pack) & need)
+    if not wanted:
+        return []
+    if len(wanted) == len(pack):
+        return None
+    factor = len(wanted) / float(len(pack))
+    result = []
+    for run in runs(wanted):
+        new_title = base[:start] + run_marker(season, run) + base[end:]
+        result.append((new_title, factor))
+    return result
+
+
+def rewrite_items(root, season, need, series):
+    """Переписывает item'ы паков. None — если ничего менять не пришлось."""
+    channel = root.find("channel")
+    if channel is None:
+        return None
+    old_items = list(channel.findall("item"))
+    new_items = []
+    changed = False
+    for item in old_items:
+        title_el = item.find("title")
+        title = (title_el.text or "") if title_el is not None else ""
+        plan = plan_item(title, season, need, series)
+        if plan is None:
+            new_items.append(item)
+            continue
+        changed = True
+        if not plan:
+            log(f"[SEASON] выбрасываем «{title[:90]}» — нужных серий нет", level=0)
+            continue
+        guid_el = item.find("guid")
+        base_guid = (guid_el.text or title) if guid_el is not None else title
+        for idx, (new_title, factor) in enumerate(plan):
+            it = copy.deepcopy(item)
+            it.find("title").text = new_title
+            scale_sizes(it, factor)
+            set_guid(it, base_guid, idx)
+            log(f"[SEASON] «{title[:70]}» -> «{new_title[:70]}» x{factor:.3f}", level=0)
+            new_items.append(it)
+    if not changed:
+        return None
+    for it in old_items:
+        channel.remove(it)
+    for it in new_items:
+        channel.append(it)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
@@ -248,14 +569,61 @@ async def handle_request(request: web.Request) -> web.Response:
             log(f"[SKIP] categories {cats} in skip-list", level=0)
             return web.Response(body=content, status=status, content_type=content_type)
 
+    # NEW: парсим season/ep из query для схлопывания диапазонов
+    season_q = re.search(r'[?&]season=(\d+)', path_qs)
+    ep_q = re.search(r'[?&]ep=(\d+)', path_qs)
+    query_season = int(season_q.group(1)) if season_q else None
+    query_ep = int(ep_q.group(1)) if ep_q else None
+
     root, titles = extract_titles(content)
     if root is None or not titles:
         return web.Response(body=content, status=status, content_type=content_type)
 
+    # Сезонный поиск (season есть, ep нет): вместо пака целиком отдаём
+    # только те серии, которых нет в библиотеке Sonarr.
+    if query_season is not None and query_ep is None:
+        try:
+            query_title = request.query.get("q", "")
+            series = match_series(query_title, await sonarr_series()) if query_title else None
+            if series:
+                episodes = await sonarr_episodes(series["id"])
+                if episodes is not None:
+                    need = missing_in_season(episodes, query_season)
+                    if need:
+                        new_xml = rewrite_items(root, query_season, need, series)
+                        if new_xml:
+                            log(f"[SEASON] «{series.get('title')}» S{query_season}: "
+                                f"нет серий {sorted(need)}", level=0)
+                            return web.Response(body=new_xml, status=200,
+                                                content_type="application/xml")
+                    else:
+                        log(f"[SEASON] «{series.get('title')}» S{query_season}: "
+                            f"недостающих серий нет", level=0)
+            else:
+                log(f"[SEASON] сериал по запросу «{query_title[:60]}» не найден", level=0)
+        except Exception as e:
+            log(f"[SEASON] error: {type(e).__name__}: {e}", level=0)
+
     mapping = {}
+    size_divisors = {}  # {старый_title: divisor}
     for el, text in titles:
         if CYR_RE.search(text):
-            normalized = normalize_title(text)
+            try:
+                normalized = normalize_title(text)
+            except Exception as e:
+                log(f"[NORM] error on «{text[:80]}»: {type(e).__name__}: {e}", level=0)
+                continue
+
+            # NEW: схлопывание диапазона под запрошенный эпизод
+            if query_season is not None and query_ep is not None:
+                try:
+                    collapsed, count = collapse_range_for_ep(normalized, query_season, query_ep)
+                    if count > 1:
+                        normalized = collapsed
+                        size_divisors[text] = count
+                except Exception as e:
+                    log(f"[COLLAPSE] error on «{normalized[:80]}»: {e}", level=0)
+
             if normalized != text:
                 mapping[text] = normalized
                 log(f"  «{text[:120]}»", level=0)
@@ -264,7 +632,7 @@ async def handle_request(request: web.Request) -> web.Response:
     if not mapping:
         return web.Response(body=content, status=status, content_type=content_type)
 
-    new_xml = replace_titles(root, mapping)
+    new_xml = replace_titles_and_sizes(root, mapping, size_divisors)
     return web.Response(body=new_xml, status=200, content_type="application/xml")
 
 

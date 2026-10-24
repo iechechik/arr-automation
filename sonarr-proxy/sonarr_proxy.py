@@ -5,8 +5,11 @@
 # - Обогащает ответы TMDb (русские названия/описания/постеры).
 # - При ENABLE_LLM=true спрашивает LLM оригинальные названия сериалов
 #   по поисковому запросу и повторяет запрос к Skyhook с найденными вариантами.
+#
+# Поддержка Sonarr v4 (пути /v1/tvdb/, /v3/, /series/lookup) и
+# Sonarr v5 (пути /v2/tvdb/, /vN/tvdb/...) — см. is_api ниже.
 
-import asyncio, aiohttp, json, ssl, socket, os
+import asyncio, aiohttp, json, re, ssl, socket, os
 from aiohttp import web
 from datetime import datetime
 
@@ -16,7 +19,7 @@ sys.path.insert(0, "/common")
 import arr_common
 
 # --- КОНФИГУРАЦИЯ ---
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+TMDB_API_KEY = "ab35147ab4e8b094369e401c2c68b51f"
 TARGET_URL   = "https://skyhook.sonarr.tv"
 CERT_FILE, KEY_FILE = "cert.pem", "key.pem"
 
@@ -429,10 +432,13 @@ async def handle_request(request):
             f"({len(llm_items)}), ниже исходный запрос ({len(first_items)})", level=1)
 
     # ── TMDb-обогащение ──────────────────────────────────────────────────
-    # Только реальные API-пути Skyhook. Раньше проверялись подстроки
-    # («search», «show»), из-за чего ветка «не обогащать» была мертва и под
-    # переписывание названий/постеров попадал любой ответ.
-    is_api = path.startswith(("/v1/tvdb/", "/v3/", "/series/lookup", "/tvdb/search"))
+    # Универсально для Sonarr v4 и v5:
+    #   v4: /v1/tvdb/..., /v3/..., /series/lookup
+    #   v5: /v2/tvdb/..., а на будущее — любой /vN/tvdb/
+    # Раньше проверялись только v1/v3, из-за чего запросы v5 (/v2/tvdb/search/)
+    # попадали в [SKIP-ENRICH] и метаданные не переводились на русский.
+    is_api = bool(re.match(r"^/v\d+/tvdb/", path)) or path.startswith(
+        ("/v1/", "/v2/", "/v3/", "/series/lookup", "/tvdb/search"))
 
     if not is_api:
         log(f"  [SKIP-ENRICH] не API-путь: {path}", level=2)

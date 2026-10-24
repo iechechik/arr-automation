@@ -1,0 +1,14 @@
+[Unit]
+Description=Sonarr: поиск пропущенных серий через 10 минут после предыдущего прогона
+
+[Timer]
+# Первый запуск через 3 минуты после загрузки
+OnBootSec=3min
+# Следующий — через 10 минут ПОСЛЕ ТОГО, как предыдущий прогон завершился
+OnUnitInactiveSec=10min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=sonarr_tracking_series.service
+
+[Install]
+WantedBy=timers.target

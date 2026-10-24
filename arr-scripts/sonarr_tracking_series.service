@@ -1,0 +1,10 @@
+[Unit]
+Description=Sonarr: автодокачка пропущенных серий (sonarr_tracking_series)
+Documentation=file:/opt/docker-compose/common-scripts/sonarr_tracking_series.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec sonarr /config/scripts/sonarr_tracking_series.sh
+TimeoutStartSec=1800
