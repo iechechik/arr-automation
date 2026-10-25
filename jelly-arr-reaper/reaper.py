@@ -15,6 +15,26 @@ SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 DELETE_FILES = os.environ.get("DELETE_FILES", "true").lower() == "true"
 
+_rescan_task = None
+
+
+async def _rescan_later(delay=30):
+    await asyncio.sleep(delay)
+    async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+        url = f"{SONARR_URL}/api/v3/command"
+        headers = {"X-Api-Key": SONARR_API_KEY}
+        async with session.post(url, headers=headers, json={"name": "RescanSeries"}) as r:
+            logger.info("Sonarr: RescanSeries (all) -> HTTP %s", r.status)
+
+
+def schedule_rescan():
+    """Дебаунс: каскад событий Episode/Season -> один rescan через 30 с тишины."""
+    global _rescan_task
+    if _rescan_task and not _rescan_task.done():
+        _rescan_task.cancel()
+    _rescan_task = asyncio.create_task(_rescan_later())
+
+
 if not RADARR_URL or not RADARR_API_KEY:
     logger.warning("Radarr not configured — movie deletions will be skipped")
 if not SONARR_URL or not SONARR_API_KEY:
@@ -138,8 +158,13 @@ async def handle_webhook(request):
             ok = await delete_sonarr_series(session, series)
             return web.json_response({"status": "deleted" if ok else "delete_failed"})
 
+    if item_type in ("Episode", "Season") and SONARR_URL and SONARR_API_KEY:
+        logger.info("Type=%s «%s» removed — Sonarr rescan scheduled", item_type, item_name)
+        schedule_rescan()
+        return web.json_response({"status": "rescan_scheduled"})
+
     # Episode, Season, и всё остальное — игнорируем
-    logger.info("Type=%s — ignored (only Movie and Series are handled)", item_type)
+    logger.info("Type=%s — ignored | item=%s", item_type, str(item)[:500])
     return web.json_response({"status": "ignored_type"})
 
 
