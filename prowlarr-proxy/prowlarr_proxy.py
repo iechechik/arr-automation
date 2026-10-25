@@ -387,8 +387,11 @@ def aired(episode):
 
 
 def missing_in_season(episodes, season):
+    # только отслеживаемые: иначе в заголовок попадёт серия, которую заказчик
+    # сознательно не мониторит, и её скачают «за компанию»
     return {e["episodeNumber"] for e in episodes
-            if e.get("seasonNumber") == season and aired(e) and not e.get("hasFile")}
+            if e.get("seasonNumber") == season and aired(e)
+            and e.get("monitored") and not e.get("hasFile")}
 
 
 def episode_span(title, season):
@@ -402,7 +405,12 @@ def episode_span(title, season):
     if m and (season is None or int(m.group("s")) == season):
         nums = [int(x) for x in re.findall(r"\d+", m.group("eps"))]
         if nums:
-            return m.span(), "multi", list(range(min(nums), max(nums) + 1))
+            # У Sonarr дырки дозаполняются (Range(first,last)), поэтому формат
+            # «E2E5» он поймёт как 2,3,4,5. Такой item не трогаем: переписывать
+            # его — значит врать про количество серий.
+            if nums != list(range(min(nums), max(nums) + 1)):
+                return None
+            return m.span(), "multi", nums
     m = EP_SINGLE_RE.search(title)
     if m and (season is None or int(m.group("s")) == season):
         return m.span(), "single", [int(m.group("a"))]
@@ -479,12 +487,21 @@ def plan_item(title, season, need, series):
         return []
     if len(wanted) == len(pack):
         return None
-    factor = len(wanted) / float(len(pack))
-    result = []
-    for run in runs(wanted):
-        new_title = base[:start] + run_marker(season, run) + base[end:]
-        result.append((new_title, factor))
-    return result
+    # ВАЖНО: ровно ОДИН item на пак. Sonarr в одном поиске берёт все одобренные
+    # решения, у которых эпизоды не пересекаются (ProcessDownloadDecisions
+    # пропускает только пересекающиеся), — два отрезка одного пака дали бы два
+    # добавления одного торрента. Поэтому берём самый длинный отрезок, остальные
+    # доберём следующим поиском.
+    segments = sorted(runs(wanted), key=len, reverse=True)
+    run = segments[0]
+    if len(segments) > 1:
+        log("[SEASON] отрезков %d, берём %s, откладываем %s"
+            % (len(segments), run_marker(season, run),
+               ", ".join(run_marker(season, r) for r in segments[1:])), level=0)
+    # доля размера — по длине ИМЕННО этого отрезка
+    factor = len(run) / float(len(pack))
+    new_title = base[:start] + run_marker(season, run) + base[end:]
+    return [(new_title, factor)]
 
 
 def rewrite_items(root, season, need, series):

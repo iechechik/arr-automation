@@ -8,8 +8,9 @@
 #   * при любом сбое/раннем выходе остановленный торрент всё равно запускается (trap на выход).
 # Radarr: фильтрации файлов нет, только гарантия, что торрент не остался остановленным.
 #
-# ManualInteractionRequired: если файл уже импортирован (already imported), удаляет ВСЕ записи
-# этого хеша из очереди Sonarr с removeFromClient=true. Это сносит и текущий эпизод, и фантомы.
+# ManualInteractionRequired: файлы с «already imported» пропускаются, а после цикла
+# (только если ошибок не было) записи этого хеша снимаются из очереди Sonarr и из клиента
+# (removeFromClient=true) — так уходят фантомы. Внутри цикла ничего не удаляется.
 #
 # Доступ к qBittorrent задаётся переменными окружения контейнера Sonarr/Radarr:
 #   QBIT_URL (по умолчанию http://qbittorrent:8080),
@@ -232,7 +233,7 @@ trap on_exit EXIT
 # =======================================================================
 sonarr_untrack() {
     local h_upper=$(echo "$HASH" | tr 'a-z' 'A-Z')
-    log "Проверка на залипшие записи в очереди Sonarr (sonarr-untrack)..."
+    log "Проверка залипших записей в очереди Sonarr (всё, кроме downloading/importing)..."
     
     local queue_json=$(curl -s -m "$CURL_TIMEOUT" -H "X-Api-Key: $API_KEY" \
         "$API_URL/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true&includeEpisode=true")
@@ -244,11 +245,11 @@ sonarr_untrack() {
     
     # Ищем записи с нашим хешем и состоянием imported/ignored
     local items=$(echo "$queue_json" | jq -r --arg h "$h_upper" \
-        '.records[] | select((.downloadId // "" | ascii_upcase) == $h and (.trackedDownloadState == "imported" or .trackedDownloadState == "ignored")) | .id')
+        '.records[] | select((.downloadId // "" | ascii_upcase) == $h and (["downloading","importing"] | index(.trackedDownloadState // "") | not)) | .id')
     
     if [ -n "$items" ]; then
         for id in $items; do
-            log "  Сброс залипшей записи ID=$id (imported/ignored)..."
+            log "  Сброс залипшей записи ID=$id..."
             CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
                 -H "X-Api-Key: $API_KEY" \
                 "$API_URL/queue/$id?removeFromClient=false&blocklist=false&changeCategory=true")
@@ -259,7 +260,7 @@ sonarr_untrack() {
             -d '{"name":"RefreshMonitoredDownloads"}' "$API_URL/command" > /dev/null
         log "  Запрошен RefreshMonitoredDownloads."
     else
-        log "  Залипших записей (imported/ignored) не найдено."
+        log "  Залипших записей не найдено."
     fi
 }
 
@@ -367,16 +368,42 @@ if [ "$EVENT_TYPE" = "Grab" ]; then
     fi
 
     UNWANTED=""
+    WANTED=""
     for ID in $(echo "$FILES_JSON" | jq -r 'keys[]'); do
         FILE_NAME=$(echo "$FILES_JSON" | jq -r ".[$ID].name")
         SN=""; EN=""
         read -r SN EN < <(echo "$FILE_NAME" | sed -nE 's/.*[sS]0*([0-9]+)[eE]0*([0-9]+).*/\1 \2/p')
+
+        # Русские имена файлов: «Серия 05», «5 серия», «Эпизод 3», «.E05.mkv».
+        # Классы вида [Сс] в sed на многобайтной кириллице не работают — только
+        # литеральные варианты в скобках. Неверно распознать хуже, чем не распознать:
+        # непонятый файл просто скачается целиком, а неверно обнулённый сломает импорт.
         if [ -z "$EN" ]; then
-            log "  [--] '$FILE_NAME' — без SxxExx. Не трогаем."
+            EN=$(echo "$FILE_NAME" | sed -nE 's/.*(Серия|серия|СЕРИЯ|Серии|серии|СЕРИИ|серию)[ _.-]*0*([0-9]{1,3}).*/\2/p' | head -1)
+            [ -n "$EN" ] && log "  (номер из «Серия N»)"
+        fi
+        if [ -z "$EN" ]; then
+            EN=$(echo "$FILE_NAME" | sed -nE 's/(^|.*[^0-9])0*([0-9]{1,3})[ _.-]*(серия|Серия|СЕРИЯ|серии|Серии|СЕРИИ|серию).*/\2/p' | head -1)
+            [ -n "$EN" ] && log "  (номер из «N серия»)"
+        fi
+        if [ -z "$EN" ]; then
+            EN=$(echo "$FILE_NAME" | sed -nE 's/.*(Эпизод|эпизод|ЭПИЗОД|Эпизоды|эпизоды|ЭПИЗОДЫ)[ _.-]*0*([0-9]{1,3}).*/\2/p' | head -1)
+            [ -n "$EN" ] && log "  (номер из «Эпизод N»)"
+        fi
+        if [ -z "$EN" ]; then
+            EN=$(echo "$FILE_NAME" | sed -nE 's/.*[^A-Za-z0-9][Ee]0*([0-9]{1,3})\.[A-Za-z0-9]+$/\1/p' | head -1)
+            [ -n "$EN" ] && log "  (номер из «.E05.ext»)"
+        fi
+        if [ -n "$EN" ] && [ -z "$SN" ]; then
+            SN="$REQ_SEASON"
+        fi
+        if [ -z "$EN" ]; then
+            log "  [--] '$FILE_NAME' — номер эпизода не распознан. Не трогаем."
             continue
         fi
         if echo "$REQUESTED_EPS_LIST" | grep -qx "$EN" && { [ -z "$REQ_SEASON" ] || [ "$SN" = "$REQ_SEASON" ]; }; then
             log "  [OK] '$FILE_NAME' — качаем."
+            WANTED="${WANTED:+$WANTED|}$ID"
         else
             log "  [0]  '$FILE_NAME' — не запрошен. Приоритет 0."
             UNWANTED="${UNWANTED:+$UNWANTED|}$ID"
@@ -385,7 +412,14 @@ if [ "$EVENT_TYPE" = "Grab" ]; then
     if [ -n "$UNWANTED" ]; then
         CODE=$(curl -s -m "$CURL_TIMEOUT" -o /dev/null -w '%{http_code}' -X POST "${AUTH[@]}" \
             -d "hash=$HASH&id=$UNWANTED&priority=0" "$QBIT_URL/api/v2/torrents/filePrio")
-        log "filePrio для файлов $UNWANTED: HTTP $CODE"
+        log "filePrio=0 для файлов $UNWANTED: HTTP $CODE"
+    fi
+    # Торрент может остаться в клиенте между захватами: файл, обнулённый в прошлый раз,
+    # надо вернуть в нормальный приоритет, иначе нужная серия так и не скачается.
+    if [ -n "$WANTED" ]; then
+        CODE=$(curl -s -m "$CURL_TIMEOUT" -o /dev/null -w '%{http_code}' -X POST "${AUTH[@]}" \
+            -d "hash=$HASH&id=$WANTED&priority=1" "$QBIT_URL/api/v2/torrents/filePrio")
+        log "filePrio=1 для файлов $WANTED: HTTP $CODE"
     fi
     log "=== Готово (Grab) ==="
     exit 0
@@ -460,46 +494,24 @@ if [ "$EVENT_TYPE" = "ManualInteractionRequired" ]; then
     SUCCESS=0
     FAIL=0
     SKIPPED=0
+    CMD_IDS=""
 
     while IFS= read -r file_item; do
         FILE_PATH=$(echo "$file_item" | jq -r '.path')
         FILE_NAME=$(echo "$file_item" | jq -r '.name')
         REJECTION=$(echo "$file_item" | jq -r '.rejections[0].reason // "none"')
+        IS_ALREADY=$(echo "$file_item" | jq -r '[.rejections[]?.reason // ""] | any(ascii_downcase | test("already imported"))')
 
         log "---"
         log "Файл    : $FILE_NAME"
         log "Путь    : $FILE_PATH"
         log "Отказ   : $REJECTION"
 
-        # Если файл уже импортирован Sonarr'ом, удаляем ВСЕ записи этого хеша из очереди
-        # с removeFromClient=true, чтобы снести фантомы.
-        if echo "$REJECTION" | grep -qi "already imported"; then
-            log "Файл уже импортирован Sonarr'ом. Удаляем все записи с хешем $DOWNLOAD_ID из очереди..."
-            HASH_UPPER=$(echo "$HASH" | tr 'a-z' 'A-Z')
-            
-            QUEUE_JSON=$(curl -s -m "$CURL_TIMEOUT" -H "X-Api-Key: $API_KEY" \
-                "$API_URL/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true&includeEpisode=true")
-            
-            if [ -n "$QUEUE_JSON" ]; then
-                TO_DELETE=$(echo "$QUEUE_JSON" | jq -r --arg h "$HASH_UPPER" \
-                    '.records[] | select((.downloadId // "" | ascii_upcase) == $h) | .id')
-                
-                if [ -n "$TO_DELETE" ]; then
-                    for id in $TO_DELETE; do
-                        log "  Удаляем запись ID=$id из клиента и очереди (removeFromClient=true)..."
-                        CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-                            -H "X-Api-Key: $API_KEY" \
-                            "$API_URL/queue/$id?removeFromClient=true&blocklist=false&changeCategory=false")
-                        log "    DELETE /queue/$id: HTTP $CODE"
-                    done
-                    # Обновляем очередь Sonarr, чтобы фантомы исчезли
-                    curl -s -m 5 -X POST -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
-                        -d '{"name":"RefreshMonitoredDownloads"}' "$API_URL/command" > /dev/null
-                    log "  Запрошен RefreshMonitoredDownloads."
-                else
-                    log "  Записей не найдено."
-                fi
-            fi
+        # Уже импортированный файл просто пропускаем. Очередь чистим ОДИН раз после
+        # цикла и только при FAIL=0 — иначе первый же такой файл удалит торрент
+        # вместе с ещё не обработанными файлами.
+        if [ "$IS_ALREADY" = "true" ] || echo "$REJECTION" | grep -qi "already imported"; then
+            log "Файл уже импортирован Sonarr'ом — пропускаем (очередь почистим после цикла)."
             SKIPPED=$((SKIPPED + 1))
             continue
         fi
@@ -538,7 +550,7 @@ if [ "$EVENT_TYPE" = "ManualInteractionRequired" ]; then
                 --argjson langId       "$LANG_ID" \
                 --arg     releaseGroup "$RELEASE_GROUP" \
                 --arg     downloadId   "$DOWNLOAD_ID" \
-                '{ name: "ManualImport", files: [{ path: $path, seriesId: $seriesId, seasonNumber: $seasonNumber, episodeIds: $episodeIds, quality: { quality: { id: $qualityId }, revision: $qualityRev }, languages: [{ id: $langId }], releaseGroup: $releaseGroup, downloadId: $downloadId }], importMode: "move" }')
+                '{ name: "ManualImport", files: [{ path: $path, seriesId: $seriesId, seasonNumber: $seasonNumber, episodeIds: $episodeIds, quality: { quality: { id: $qualityId }, revision: $qualityRev }, languages: [{ id: $langId }], releaseGroup: $releaseGroup, downloadId: $downloadId }], importMode: "auto" }')
         else
             IMPORT_BODY=$(jq -n \
                 --arg     path         "$FILE_PATH" \
@@ -548,7 +560,7 @@ if [ "$EVENT_TYPE" = "ManualInteractionRequired" ]; then
                 --argjson langId       "$LANG_ID" \
                 --arg     releaseGroup "$RELEASE_GROUP" \
                 --arg     downloadId   "$DOWNLOAD_ID" \
-                '{ name: "ManualImport", files: [{ path: $path, movieId: $movieId, quality: { quality: { id: $qualityId }, revision: $qualityRev }, languages: [{ id: $langId }], releaseGroup: $releaseGroup, downloadId: $downloadId }], importMode: "move" }')
+                '{ name: "ManualImport", files: [{ path: $path, movieId: $movieId, quality: { quality: { id: $qualityId }, revision: $qualityRev }, languages: [{ id: $langId }], releaseGroup: $releaseGroup, downloadId: $downloadId }], importMode: "auto" }')
         fi
 
         log "Отправляем импорт..."
@@ -564,6 +576,8 @@ if [ "$EVENT_TYPE" = "ManualInteractionRequired" ]; then
         if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
             log "OK (HTTP $HTTP_CODE): $FILE_NAME"
             SUCCESS=$((SUCCESS + 1))
+            CMD_ID_DONE=$(echo "$RESP_BODY" | jq -r '.id // empty' 2>/dev/null)
+            [ -n "$CMD_ID_DONE" ] && CMD_IDS="$CMD_IDS $CMD_ID_DONE"
         else
             log "ОШИБКА (HTTP $HTTP_CODE): $RESP_BODY"
             FAIL=$((FAIL + 1))
@@ -571,6 +585,52 @@ if [ "$EVENT_TYPE" = "ManualInteractionRequired" ]; then
     done < "$TMPFILE"
 
     rm -f "$TMPFILE"
+
+    # POST /command возвращается сразу, импорт идёт в фоне. Дожидаемся команд:
+    # иначе чистка очереди может удалить торрент с ещё не импортированными файлами.
+    for C in $CMD_IDS; do
+        S=""
+        for _ in $(seq 1 60); do
+            S=$(curl -s -m 10 -H "X-Api-Key: $API_KEY" "$API_URL/command/$C" | jq -r '.status // empty')
+            case "$S" in
+                completed) break ;;
+                failed|aborted)
+                    log "  команда импорта $C завершилась статусом $S"
+                    FAIL=$((FAIL + 1)); break ;;
+            esac
+            sleep 2
+        done
+        # Не дождались за 2 минуты — импорт ещё идёт: чистка запрещена.
+        case "$S" in
+            completed|failed|aborted) ;;
+            *)
+                log "  команда импорта $C не завершилась за 2 мин (статус: ${S:-?}) — чистку очереди пропускаем"
+                FAIL=$((FAIL + 1)) ;;
+        esac
+    done
+
+    # Часть файлов уже была импортирована и ни один не упал -> снимаем записи этого
+    # хэша из очереди и из клиента (фантомы). Только ПОСЛЕ обработки всех файлов.
+    if [ "$SKIPPED" -gt 0 ] && [ "$FAIL" -eq 0 ]; then
+        HASH_UPPER=$(echo "$HASH" | tr 'a-z' 'A-Z')
+        QUEUE_JSON=$(curl -s -m "$CURL_TIMEOUT" -H "X-Api-Key: $API_KEY" \
+            "$API_URL/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true&includeEpisode=true")
+        TO_DELETE=$(echo "$QUEUE_JSON" | jq -r --arg h "$HASH_UPPER" \
+            '.records[] | select((.downloadId // "" | ascii_upcase) == $h) | .id' 2>/dev/null)
+        if [ -n "$TO_DELETE" ]; then
+            for qid in $TO_DELETE; do
+                QCODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+                    -H "X-Api-Key: $API_KEY" \
+                    "$API_URL/queue/$qid?removeFromClient=true&blocklist=false&changeCategory=false")
+                log "  чистка очереди: DELETE /queue/$qid -> HTTP $QCODE"
+            done
+            curl -s -m 5 -X POST -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+                -d '{"name":"RefreshMonitoredDownloads"}' "$API_URL/command" > /dev/null
+        else
+            log "  чистка очереди: записей этого хэша нет."
+        fi
+    fi
+
     log "=== Готово. Успешно: $SUCCESS, ошибок: $FAIL, пропущено (уже импортированы): $SKIPPED ==="
     if [ "$FAIL" -gt 0 ]; then
         exit 1

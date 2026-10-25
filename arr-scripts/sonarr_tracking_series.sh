@@ -31,6 +31,8 @@ API_URL=${API_URL:-http://localhost:8989/api/v3}
 API_KEY=${API_KEY:-}
 DRY=${DRY:-0}
 MAX_GRABS=${MAX_GRABS:-1}
+STATE_FILE=${STATE_FILE:-/config/scripts/state/tracking_state.tsv}
+REPEAT_HOURS=${REPEAT_HOURS:-6}   # не искать ту же пару раньше, чем через N часов (если поиск был пустым)
 SEARCH_TIMEOUT=${SEARCH_TIMEOUT:-300}
 
 log() {
@@ -69,9 +71,29 @@ api() {
 
 # История захватов обновляется сразу, а очередь — только на следующем опросе
 # клиента (~40 c). Поэтому «взяли или нет» смотрим по истории, очередь — запасной признак.
-last_grab_hash() {   # $1 seriesId
+# Сравнивать надо ID записи, а не хэш: при докачке того же пака хэш не меняется,
+# и сравнение по хэшу даёт ложное «ничего не взято».
+last_grab_id() {   # $1 seriesId
+    api "$API_URL/history?seriesId=$1&eventType=1&pageSize=1&sortKey=date&sortDirection=descending" \
+        | jq -r '.records[0].id // empty'
+}
+
+last_grab_hash() {   # $1 seriesId — только для лога
     api "$API_URL/history?seriesId=$1&eventType=1&pageSize=1&sortKey=date&sortDirection=descending" \
         | jq -r '.records[0].downloadId // empty'
+}
+
+state_get() {   # $1 ключ seriesId:season -> epoch последнего пустого поиска
+    [ -f "$STATE_FILE" ] || return 0
+    awk -F'\t' -v k="$1" '$1==k && $3=="empty" {print $2}' "$STATE_FILE" 2>/dev/null | tail -1
+}
+
+state_set() {   # $1 ключ, $2 result (empty|grab)
+    mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+    local now; now=$(date +%s)
+    [ -f "$STATE_FILE" ] && grep -v "^$1$(printf '\t')" "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$1" "$now" "$2" >> "${STATE_FILE}.tmp"
+    mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
 }
 
 log "=== Старт${DRY:+ (DRY=$DRY)} ==="
@@ -93,7 +115,11 @@ log "Пропущено серий: $TOTAL; пар «сериал + сезон»
 
 # --- 2. кто уже в очереди ---------------------------------------------------
 QUEUE=$(api "$API_URL/queue?page=1&pageSize=1000&includeSeries=true")
-IN_QUEUE=$(echo "$QUEUE" | jq -r '.records[]?.seriesId' | sort -u)
+# Залипшие записи в imported/ignored/failed не должны навсегда блокировать сериал.
+IN_QUEUE=$(echo "$QUEUE" | jq -r '
+    .records[]?
+    | select((.trackedDownloadState // "") | IN("downloading","importing","importPending","importBlocked","failedPending"))
+    | .seriesId' | sort -u)
 
 # --- 3. последовательный поиск ---------------------------------------------
 SEARCHED=0
@@ -106,12 +132,22 @@ while IFS=$'\t' read -r SERIES_ID SEASON TITLE; do
         continue
     fi
 
+    STATE_KEY="$SERIES_ID:$SEASON"
+    LAST_EMPTY=$(state_get "$STATE_KEY")
+    if [ -n "$LAST_EMPTY" ]; then
+        AGE=$(( $(date +%s) - LAST_EMPTY ))
+        if [ "$AGE" -lt $(( REPEAT_HOURS * 3600 )) ]; then
+            log "  «$TITLE» S$SEASON — искали $((AGE / 60)) мин назад впустую, пропуск (REPEAT_HOURS=$REPEAT_HOURS)."
+            continue
+        fi
+    fi
+
     if [ "$DRY" = "1" ]; then
         log "  [DRY] «$TITLE» S$SEASON — искал бы (seriesId=$SERIES_ID)."
         continue
     fi
 
-    PREV_HASH=$(last_grab_hash "$SERIES_ID")
+    PREV_ID=$(last_grab_id "$SERIES_ID")
     log "  «$TITLE» S$SEASON — SeasonSearch…"
     CMD=$(api -X POST -H "Content-Type: application/json" \
         -d "{\"name\":\"SeasonSearch\",\"seriesId\":$SERIES_ID,\"seasonNumber\":$SEASON}" \
@@ -139,23 +175,28 @@ while IFS=$'\t' read -r SERIES_ID SEASON TITLE; do
     fi
 
     HIT=""
-    NEW_HASH=$(last_grab_hash "$SERIES_ID")
-    if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" != "$PREV_HASH" ]; then
-        HIT="$NEW_HASH"
+    NEW_ID=$(last_grab_id "$SERIES_ID")
+    if [ -n "$NEW_ID" ] && [ "$NEW_ID" != "$PREV_ID" ]; then
+        HIT=$(last_grab_hash "$SERIES_ID")
     fi
     if [ -z "$HIT" ]; then
         QUEUE=$(api "$API_URL/queue?page=1&pageSize=1000&includeSeries=true")
-        HIT=$(echo "$QUEUE" | jq -r '.records[]? | select(.seriesId == '"$SERIES_ID"') | .downloadId' | head -1)
+        HIT=$(echo "$QUEUE" | jq -r '.records[]?
+            | select(.seriesId == '"$SERIES_ID"')
+            | select((.trackedDownloadState // "") | IN("downloading","importing","importPending","importBlocked","failedPending"))
+            | .downloadId' | head -1)
     fi
     if [ -n "$HIT" ]; then
         GRABS=$((GRABS + 1))
+        state_set "$STATE_KEY" grab
         log "    захват есть (hash ${HIT:0:12}), захватов за прогон: $GRABS"
         if [ "$GRABS" -ge "$MAX_GRABS" ]; then
             log "    достигнут лимит MAX_GRABS=$MAX_GRABS — останавливаемся."
             break
         fi
     else
-        log "    ничего не взято."
+        state_set "$STATE_KEY" empty
+        log "    ничего не взято (повторно не раньше чем через ${REPEAT_HOURS} ч)."
     fi
 done <<< "$TARGETS"
 
