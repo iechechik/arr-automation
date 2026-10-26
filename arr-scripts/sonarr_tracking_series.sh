@@ -13,6 +13,11 @@
 #      торрент может закрыть сразу несколько серий (например S1E3E4).
 #   5. Останавливается после первого же захвата (MAX_GRABS), чтобы не сыпать
 #      пачку торрентов в qBittorrent за один прогон.
+#   6. Второй проход — «порог качества» (/wanted/cutoff: файл есть, но качество
+#      ниже cutoff профиля). Берётся ОДИН эпизод на пару «сериал+сезон», чтобы
+#      не добавить один и тот же пак дважды, и запускается EpisodeSearch.
+#      Такой поиск Sonarr сам никогда не делает: вкладка «Порог не достигнут» —
+#      только отчёт, а CutoffUnmetEpisodeSearch шлётся лишь при добавлении сериала.
 #
 # Запуск: внутри контейнера Sonarr —
 #   docker exec sonarr /config/scripts/sonarr_tracking_series.sh
@@ -21,6 +26,8 @@
 #   DRY=1            — только показать, что искали бы, ничего не запускать
 #   MAX_GRABS=N      — сколько захватов допустимо за прогон (по умолчанию 1)
 #   SEARCH_TIMEOUT=N — сколько секунд ждать завершения одной команды поиска (300)
+#   WITH_CUTOFF=0|1  — второй проход по качеству (по умолчанию 1)
+#   CUTOFF_REPEAT_HOURS=N — не искать тот же эпизод раньше N часов (по умолчанию 24)
 #   LOG_FILE=...     — путь лога (по умолчанию /config/scripts/sonarr_tracking_series.log)
 #   API_URL, API_KEY — если нужно переопределить (по умолчанию localhost:8989 и config.xml)
 # =============================================================================
@@ -34,6 +41,8 @@ MAX_GRABS=${MAX_GRABS:-1}
 STATE_FILE=${STATE_FILE:-/config/scripts/state/tracking_state.tsv}
 REPEAT_HOURS=${REPEAT_HOURS:-6}   # не искать ту же пару раньше, чем через N часов (если поиск был пустым)
 SEARCH_TIMEOUT=${SEARCH_TIMEOUT:-300}
+WITH_CUTOFF=${WITH_CUTOFF:-1}
+CUTOFF_REPEAT_HOURS=${CUTOFF_REPEAT_HOURS:-24}
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] [tracking] $*" | tee -a "$LOG_FILE"
@@ -108,8 +117,8 @@ fi
 TOTAL=$(echo "$MISSING" | jq -r '.totalRecords // 0')
 TARGETS=$(echo "$MISSING" | jq -r '.records[]? | "\(.seriesId)\t\(.seasonNumber)\t\(.series.title)"' | sort -u)
 if [ -z "$TARGETS" ]; then
-    log "Пропущенных серий нет."
-    exit 0
+    log "Пропущенных серий нет — идём ко второму проходу (качество)."
+    TARGETS=""
 fi
 log "Пропущено серий: $TOTAL; пар «сериал + сезон»: $(echo "$TARGETS" | wc -l)"
 
@@ -124,8 +133,10 @@ IN_QUEUE=$(echo "$QUEUE" | jq -r '
 # --- 3. последовательный поиск ---------------------------------------------
 SEARCHED=0
 GRABS=0
+TOUCHED=""
 while IFS=$'\t' read -r SERIES_ID SEASON TITLE; do
     [ -z "$SERIES_ID" ] && continue
+    TOUCHED="$TOUCHED $SERIES_ID"
 
     if echo "$IN_QUEUE" | grep -qx "$SERIES_ID"; then
         log "  «$TITLE» S$SEASON — сериал уже в очереди, пропуск."
@@ -199,5 +210,97 @@ while IFS=$'\t' read -r SERIES_ID SEASON TITLE; do
         log "    ничего не взято (повторно не раньше чем через ${REPEAT_HOURS} ч)."
     fi
 done <<< "$TARGETS"
+
+# --- 4. второй проход: качество ниже порога профиля -------------------------
+if [ "$WITH_CUTOFF" = "1" ] && [ "$GRABS" -lt "$MAX_GRABS" ]; then
+    CUTOFF=$(api "$API_URL/wanted/cutoff?page=1&pageSize=2000&includeSeries=true&monitored=true")
+    if [ -z "$CUTOFF" ]; then
+        log "Не удалось получить /wanted/cutoff — проход по качеству пропущен."
+    else
+        CTOTAL=$(echo "$CUTOFF" | jq -r '.totalRecords // 0')
+        # один эпизод на пару «сериал + сезон» — самый младший по номеру
+        CTARGETS=$(echo "$CUTOFF" | jq -r '.records[]? | "\(.seriesId)\t\(.seasonNumber)\t\(.episodeNumber)\t\(.id)\t\(.series.title)"' \
+            | sort -t$'\t' -k1,1n -k2,2n -k3,3n | awk -F'\t' '!seen[$1 FS $2]++')
+        if [ -z "$CTARGETS" ]; then
+            log "Ниже порога качества серий нет."
+        else
+            log "Ниже порога серий: $CTOTAL; целей на прогон: $(echo "$CTARGETS" | wc -l) (по одному эпизоду на сериал+сезон)"
+            IN_QUEUE=$(api "$API_URL/queue?page=1&pageSize=1000&includeSeries=true" | jq -r '
+                .records[]?
+                | select((.trackedDownloadState // "") | IN("downloading","importing","importPending","importBlocked","failedPending"))
+                | .seriesId' | sort -u)
+
+            while IFS=$'\t' read -r SERIES_ID SEASON EPISODE EPISODE_ID TITLE; do
+                [ -z "$SERIES_ID" ] && continue
+                if [ "$GRABS" -ge "$MAX_GRABS" ]; then
+                    log "  достигнут лимит MAX_GRABS=$MAX_GRABS — второй проход остановлен."
+                    break
+                fi
+                if echo " $TOUCHED " | grep -q " $SERIES_ID "; then
+                    log "  «$TITLE» S${SEASON}E$EPISODE — сериал уже искали в этом прогоне, пропуск."
+                    continue
+                fi
+                if echo "$IN_QUEUE" | grep -qx "$SERIES_ID"; then
+                    log "  «$TITLE» S${SEASON}E$EPISODE — сериал в очереди, пропуск."
+                    continue
+                fi
+
+                STATE_KEY="$SERIES_ID:$SEASON:$EPISODE:cutoff"
+                LAST_EMPTY=$(state_get "$STATE_KEY")
+                if [ -n "$LAST_EMPTY" ]; then
+                    AGE=$(( $(date +%s) - LAST_EMPTY ))
+                    if [ "$AGE" -lt $(( CUTOFF_REPEAT_HOURS * 3600 )) ]; then
+                        log "  «$TITLE» S${SEASON}E$EPISODE — искали $((AGE / 60)) мин назад впустую, пропуск."
+                        continue
+                    fi
+                fi
+
+                if [ "$DRY" = "1" ]; then
+                    log "  [DRY] «$TITLE» S${SEASON}E$EPISODE — искал бы апгрейд (episodeId=$EPISODE_ID)."
+                    continue
+                fi
+
+                PREV_ID=$(last_grab_id "$SERIES_ID")
+                log "  «$TITLE» S${SEASON}E$EPISODE — EpisodeSearch (апгрейд)…"
+                CMD=$(api -X POST -H "Content-Type: application/json" \
+                    -d "{\"name\":\"EpisodeSearch\",\"episodeIds\":[$EPISODE_ID]}" \
+                    "$API_URL/command")
+                CMD_ID=$(echo "$CMD" | jq -r '.id // empty')
+                if [ -z "$CMD_ID" ]; then
+                    log "    команда не создалась: $(echo "$CMD" | head -c 200)"
+                    continue
+                fi
+
+                WAITED=0
+                STATUS=""
+                while [ "$WAITED" -lt "$SEARCH_TIMEOUT" ]; do
+                    sleep 5
+                    WAITED=$((WAITED + 5))
+                    STATUS=$(api "$API_URL/command/$CMD_ID" | jq -r '.status // empty')
+                    case "$STATUS" in
+                        completed|failed|aborted) break ;;
+                    esac
+                done
+                SEARCHED=$((SEARCHED + 1))
+                [ "$STATUS" != "completed" ] && log "    поиск не завершился штатно (статус: ${STATUS:-таймаут})"
+
+                HIT=""
+                NEW_ID=$(last_grab_id "$SERIES_ID")
+                if [ -n "$NEW_ID" ] && [ "$NEW_ID" != "$PREV_ID" ]; then
+                    HIT=$(last_grab_hash "$SERIES_ID")
+                fi
+                TOUCHED="$TOUCHED $SERIES_ID"
+                if [ -n "$HIT" ]; then
+                    GRABS=$((GRABS + 1))
+                    state_set "$STATE_KEY" grab
+                    log "    захват есть (hash ${HIT:0:12}), захватов за прогон: $GRABS"
+                else
+                    state_set "$STATE_KEY" empty
+                    log "    апгрейд не взят (повторно не раньше чем через ${CUTOFF_REPEAT_HOURS} ч)."
+                fi
+            done <<< "$CTARGETS"
+        fi
+    fi
+fi
 
 log "=== Готово: поисков $SEARCHED, захватов $GRABS ==="

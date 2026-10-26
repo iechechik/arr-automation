@@ -10,6 +10,7 @@
 # Sonarr v5 (пути /v2/tvdb/, /vN/tvdb/...) — см. is_api ниже.
 
 import asyncio, aiohttp, json, re, ssl, socket, os
+import time
 from aiohttp import web
 from datetime import datetime
 
@@ -19,7 +20,7 @@ sys.path.insert(0, "/common")
 import arr_common
 
 # --- КОНФИГУРАЦИЯ ---
-TMDB_API_KEY = "ab35147ab4e8b094369e401c2c68b51f"
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 TARGET_URL   = "https://skyhook.sonarr.tv"
 CERT_FILE, KEY_FILE = "cert.pem", "key.pem"
 
@@ -143,7 +144,7 @@ async def llm_resolve_term(term):
 # ---------------------------------------------------------------------------
 
 async def get_ru_data(tvdb_id, original_title=""):
-    if not arr_common.should_ask(tmdb_cache, tvdb_id):
+    if not _needs_refresh(tvdb_id):
         log(f"  [CACHE] tvdbId={tvdb_id} «{original_title}»", level=2)
         return tmdb_cache.get(tvdb_id)
 
@@ -239,6 +240,7 @@ async def get_ru_data(tvdb_id, original_title=""):
         'p': final_path or None,
         '_why':  chosen_why,
         '_vote': vote_str,
+        '_ts': time.time(),
     }
     tmdb_cache[tvdb_id] = data
     tmdb_cache.save()
@@ -293,6 +295,205 @@ def dedup_by_tvdb(items):
         seen.add(key)
         result.append(it)
     return result
+
+# ---------------------------------------------------------------------------
+# ЭПИЗОДЫ: TBA / пустые описания -> TMDb
+# ---------------------------------------------------------------------------
+import datetime as _dt
+
+EP_FILL_LANGS = {"rus": "ru-RU"}      # язык Skyhook -> язык TMDb
+EP_SEASON_TTL = int(os.environ.get("EP_SEASON_TTL", str(6 * 3600)))
+_tmdb_ids = {}                        # tvdbId -> tmdbId
+_tmdb_seasons = {}                    # (tmdbId, season, lang) -> (ts, {номер: {...}})
+TBA_RE = re.compile(r'^\s*(?:tba|tbd)?\s*$', re.I)
+PLACEHOLDER_RE = re.compile(r'^\s*(?:серия|эпизод|episode)\s*\d+\s*$', re.I)
+
+
+def _near(a, b):
+    """Даты отличаются не больше чем на день (часовые пояса). Нет даты — не придираемся."""
+    try:
+        return abs((_dt.date.fromisoformat(a[:10]) - _dt.date.fromisoformat(b[:10])).days) <= 1
+    except Exception:
+        return True
+
+
+async def get_tmdb_id(tvdb_id):
+    tid = str(tvdb_id)
+    if tid in _tmdb_ids:
+        return _tmdb_ids[tid]
+    url = (f"https://api.themoviedb.org/3/find/{tid}"
+           f"?api_key={TMDB_API_KEY}&external_source=tvdb_id")
+    async with throttle:
+        try:
+            async with http_session.get(url, headers=FAKE_HEADERS, timeout=10, ssl=False) as r:
+                if r.status != 200:
+                    log_err(f"[TMDB/find-ep] tvdbId={tid} HTTP {r.status}")
+                    return None
+                res = await r.json()
+        except Exception as e:
+            log_err(f"[TMDB/find-ep-EXC] tvdbId={tid}: {type(e).__name__}: {e or '(no message)'}")
+            return None
+    found = res.get('tv_results') or []
+    if not found:
+        return None
+    _tmdb_ids[tid] = found[0].get('id')
+    return _tmdb_ids[tid]
+
+
+async def get_tmdb_season(tmdb_id, season, lang):
+    key = (tmdb_id, season, lang)
+    hit = _tmdb_seasons.get(key)
+    if hit and time.time() - hit[0] < EP_SEASON_TTL:
+        return hit[1]
+    url = (f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}"
+           f"?api_key={TMDB_API_KEY}&language={lang}")
+    async with throttle:
+        try:
+            async with http_session.get(url, headers=FAKE_HEADERS, timeout=10, ssl=False) as r:
+                if r.status == 404:      # такого сезона в TMDb нет (ещё не вышел) — не ошибка
+                    _tmdb_seasons[key] = (time.time(), {})
+                    return {}
+                if r.status != 200:
+                    log_err(f"[TMDB/season] tmdbId={tmdb_id} S{season} HTTP {r.status}")
+                    return hit[1] if hit else {}
+                res = await r.json()
+        except Exception as e:
+            log_err(f"[TMDB/season-EXC] tmdbId={tmdb_id} S{season}: {type(e).__name__}: {e or '(no message)'}")
+            return hit[1] if hit else {}
+    out = {}
+    for x in res.get('episodes') or []:
+        if isinstance(x, dict) and x.get('episode_number') is not None:
+            out[x['episode_number']] = {'name': x.get('name') or '',
+                                        'overview': x.get('overview') or '',
+                                        'air_date': x.get('air_date') or ''}
+    _tmdb_seasons[key] = (time.time(), out)
+    return out
+
+
+async def fill_episodes(item, tvdb_id, tmdb_lang):
+    """Подставляет русские названия/описания вместо TBA/пустых. Готовые переводы не трогает."""
+    eps = item.get('episodes')
+    if not isinstance(eps, list):
+        log(f"  [EPISODES] нет массива episodes; ключи: {sorted(item.keys())[:30]}", level=2)
+        return
+    bad = [e for e in eps if isinstance(e, dict)
+           and (TBA_RE.match(e.get('title') or '') or not (e.get('overview') or '').strip())]
+    if not bad:
+        return
+    log(f"  [EPISODES] ключи эпизода: {sorted(bad[0].keys())}", level=2)
+    tmdb_id = await get_tmdb_id(tvdb_id)
+    if not tmdb_id:
+        log(f"  [EPISODES] tvdbId={tvdb_id}: нет в TMDb — серии не трогаем", level=1)
+        return
+    seasons = sorted({e.get('seasonNumber') for e in bad if isinstance(e.get('seasonNumber'), int)})
+    maps = dict(zip(seasons, await asyncio.gather(
+        *[get_tmdb_season(tmdb_id, s, tmdb_lang) for s in seasons])))
+    n_t = n_o = n_skip = 0
+    for e in bad:
+        tm = (maps.get(e.get('seasonNumber')) or {}).get(e.get('episodeNumber'))
+        if not tm:
+            continue
+        if not _near(e.get('airDate') or e.get('airDateUtc') or '', tm['air_date']):
+            n_skip += 1          # нумерация TMDb расходится с TVDB — не рискуем
+            continue
+        name = tm['name'].strip()
+        if TBA_RE.match(e.get('title') or '') and name and not PLACEHOLDER_RE.match(name):
+            e['title'] = name
+            n_t += 1
+        if not (e.get('overview') or '').strip() and tm['overview'].strip():
+            e['overview'] = tm['overview'].strip()
+            n_o += 1
+    log(f"  [EPISODES] «{item.get('title', '?')}»: названий {n_t}, описаний {n_o}, "
+        f"пропущено из-за расхождения дат {n_skip} (сезоны {seasons})", level=1)
+
+
+# ---------------------------------------------------------------------------
+# ЭПИЗОДЫ: английский запасной вариант
+# Что не нашлось по-русски (TBA / пусто), берём из английского ответа Skyhook.
+# Нигде не сохраняется на диск: когда появится русский — подставится он.
+# ---------------------------------------------------------------------------
+_sky_eng = {}                         # tvdbId -> (ts, данные сериала на eng)
+
+
+async def get_skyhook_eng(tvdb_id):
+    tid = str(tvdb_id)
+    hit = _sky_eng.get(tid)
+    if hit and time.time() - hit[0] < EP_SEASON_TTL:
+        return hit[1]
+    res = await fetch_skyhook("GET", f"{TARGET_URL}/v2/tvdb/shows/eng/{tid}/official",
+                              FAKE_HEADERS, None)
+    if res is None:
+        return hit[1] if hit else None
+    status, content_type, content = res
+    if status != 200 or "json" not in (content_type or ""):
+        log_err(f"[EN-FALLBACK] tvdbId={tid}: HTTP {status}")
+        return hit[1] if hit else None
+    try:
+        data = json.loads(content)
+    except Exception as e:
+        log_err(f"[EN-FALLBACK] tvdbId={tid}: JSON {type(e).__name__}: {e}")
+        return hit[1] if hit else None
+    if not isinstance(data, dict):
+        return hit[1] if hit else None
+    _sky_eng[tid] = (time.time(), data)
+    return data
+
+
+async def fill_en_fallback(item, tvdb_id):
+    """Вместо TBA / пустого описания (серии и сам сериал) — английская версия."""
+    eps = item.get('episodes') if isinstance(item.get('episodes'), list) else []
+    bad = [e for e in eps if isinstance(e, dict)
+           and (TBA_RE.match(e.get('title') or '') or not (e.get('overview') or '').strip())]
+    need_series = not (item.get('overview') or '').strip()
+    if not bad and not need_series:
+        return
+    en = await get_skyhook_eng(tvdb_id)
+    if not en:
+        return
+    n_s = n_t = n_o = 0
+    if need_series and (en.get('overview') or '').strip():
+        item['overview'] = en['overview'].strip()
+        n_s = 1
+    by_id, by_num = {}, {}
+    for x in en.get('episodes') or []:
+        if isinstance(x, dict):
+            if x.get('tvdbId') is not None:
+                by_id[x['tvdbId']] = x
+            by_num[(x.get('seasonNumber'), x.get('episodeNumber'))] = x
+    for e in bad:
+        x = by_id.get(e.get('tvdbId')) or by_num.get((e.get('seasonNumber'), e.get('episodeNumber')))
+        if not x:
+            continue
+        t = (x.get('title') or '').strip()
+        if TBA_RE.match(e.get('title') or '') and t and not TBA_RE.match(t):
+            e['title'] = t
+            n_t += 1
+        o = (x.get('overview') or '').strip()
+        if not (e.get('overview') or '').strip() and o:
+            e['overview'] = o
+            n_o += 1
+    if n_s or n_t or n_o:
+        log(f"  [EN-FALLBACK] «{item.get('title', '?')}»: описание сериала {n_s}, "
+            f"названий серий {n_t}, описаний серий {n_o} (по-английски)", level=1)
+
+
+# ---------------------------------------------------------------------------
+# КЭШ: переспрос пустых описаний
+# Запись без русского описания переспрашиваем у TMDb раз в EMPTY_REASK
+# (раньше она жила в кэше вечно, и русское описание никогда не подтягивалось).
+# ---------------------------------------------------------------------------
+EMPTY_REASK = int(os.environ.get("EMPTY_REASK", str(7 * 24 * 3600)))
+
+
+def _needs_refresh(tvdb_id):
+    """True, если TMDb надо спросить: записи нет / «нет» устарело / нет описания уже давно."""
+    if arr_common.should_ask(tmdb_cache, tvdb_id):
+        return True
+    cached = tmdb_cache.get(tvdb_id)
+    return (isinstance(cached, dict) and not arr_common.is_no(cached) and 'o' in cached
+            and not (cached.get('o') or '').strip()
+            and time.time() - cached.get('_ts', 0) > EMPTY_REASK)
+
 
 # ---------------------------------------------------------------------------
 # ОСНОВНОЙ ОБРАБОТЧИК
@@ -446,10 +647,20 @@ async def handle_request(request):
             all_items[0] if (len(all_items) == 1 and not first_was_list) else all_items,
             dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
 
+    # ── Названия/описания серий: TBA → TMDb (только языки из EP_FILL_LANGS) ──
+    m_sh = re.match(r"^/v2/tvdb/shows/([a-z]{2,3})/(\d+)", path)
+    if m_sh and TMDB_API_KEY and m_sh.group(1) in EP_FILL_LANGS:
+        for it in all_items:
+            if isinstance(it, dict):
+                try:
+                    await fill_episodes(it, m_sh.group(2), EP_FILL_LANGS[m_sh.group(1)])
+                except Exception as e:
+                    log_err(f"[EPISODES] {type(e).__name__}: {e or '(no message)'}")
+
     tasks = [
         get_ru_data(str(item['tvdbId']), item.get('title', ''))
         for item in all_items[:ENRICH_LIMIT]
-        if item.get('tvdbId') and arr_common.should_ask(tmdb_cache, str(item['tvdbId']))
+        if item.get('tvdbId') and _needs_refresh(str(item['tvdbId']))
     ]
     if tasks:
         log(f"  [API] Новых запросов к TMDB: {len(tasks)} "
@@ -521,6 +732,15 @@ async def handle_request(request):
         log(f"  [--] Без перевода ({len(skipped)}): " +
             ", ".join(f"«{s}»" for s in skipped), level=1)
 
+    # ── Запасной вариант: чего нет по-русски — английская версия ──
+    if m_sh and m_sh.group(1) in EP_FILL_LANGS:
+        for it in all_items:
+            if isinstance(it, dict):
+                try:
+                    await fill_en_fallback(it, m_sh.group(2))
+                except Exception as e:
+                    log_err(f"[EN-FALLBACK] {type(e).__name__}: {e or '(no message)'}")
+
     log_sep("═", level=2)
 
     # Возвращаем в том же формате, что пришёл: список — список, объект — объект
@@ -550,6 +770,8 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
 
+    if not TMDB_API_KEY:
+        log_err("TMDB_API_KEY не задан — TMDb-обогащение и заполнение серий отключены")
     print("=" * 72, flush=True)
     print(f"  SONARR-PROXY READY  |  DEBUG_LEVEL={DEBUG_LEVEL}"
           f"  ({'errors only' if DEBUG_LEVEL==0 else 'compact' if DEBUG_LEVEL==1 else 'verbose'})",

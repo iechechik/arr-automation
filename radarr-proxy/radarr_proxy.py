@@ -8,6 +8,7 @@
 #   по поисковому запросу и повторяет запрос к Radarr с найденными вариантами.
 
 import asyncio, aiohttp, json, ssl, socket, os
+import time
 from aiohttp import web
 from datetime import datetime
 
@@ -17,7 +18,7 @@ sys.path.insert(0, "/common")
 import arr_common
 
 # --- КОНФИГУРАЦИЯ ---
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 
 HOST_MAP = {
     "radarr.servarr.com": "https://radarr.servarr.com",
@@ -137,9 +138,14 @@ async def get_ru_data(tmdb_id):
     if not tmdb_id:
         return None
 
-    if not arr_common.should_ask(radarr_cache, tmdb_id):
+    cached = radarr_cache.get(tmdb_id)
+    # запись без русского описания переспрашиваем раз в EMPTY_REASK (старые записи без _ts — сразу)
+    stale_empty = (isinstance(cached, dict) and 'o' in cached
+                   and not (cached.get('o') or '').strip()
+                   and time.time() - cached.get('_ts', 0) > EMPTY_REASK)
+    if not arr_common.should_ask(radarr_cache, tmdb_id) and not stale_empty:
         log(f"  [CACHE] Найдено в текстовом кэше tmdbId={tmdb_id}", level=2)
-        return radarr_cache.get(tmdb_id)
+        return cached
 
     url = (
         f"https://api.themoviedb.org/3/movie/{tmdb_id}"
@@ -190,6 +196,7 @@ async def get_ru_data(tmdb_id):
             'p': final_path or None,
             '_why': chosen_why,
             '_vote': vote_str,
+            '_ts': time.time(),
         }
         radarr_cache[tmdb_id] = data
         radarr_cache.save()
@@ -198,6 +205,37 @@ async def get_ru_data(tmdb_id):
     except Exception as e:
         log_err(f"[TMDB-EXC] ID={tmdb_id}: {type(e).__name__}: {e or '(no message)'}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# ОПИСАНИЕ ФИЛЬМА: английский запасной вариант
+# Нет русского описания — берём английское из TMDb. На диск не пишется:
+# когда появится русское, подставится оно (пустые записи переспрашиваются раз в EMPTY_REASK).
+# ---------------------------------------------------------------------------
+EMPTY_REASK = int(os.environ.get("EMPTY_REASK", str(7 * 24 * 3600)))
+EN_TTL = int(os.environ.get("EN_TTL", str(6 * 3600)))
+_en_overview = {}                     # tmdbId -> (ts, текст)
+
+
+async def get_en_overview(tmdb_id):
+    hit = _en_overview.get(tmdb_id)
+    if hit and time.time() - hit[0] < EN_TTL:
+        return hit[1]
+    url = (f"https://api.themoviedb.org/3/movie/{tmdb_id}"
+           f"?api_key={TMDB_API_KEY}&language=en-US")
+    try:
+        async with throttle, http_session.get(url, headers=FAKE_HEADERS,
+                                             timeout=10, ssl=False) as r:
+            if r.status != 200:
+                log_err(f"[TMDB/en] ID={tmdb_id} HTTP {r.status}")
+                return hit[1] if hit else ""
+            res = await r.json()
+    except Exception as e:
+        log_err(f"[TMDB/en-EXC] ID={tmdb_id}: {type(e).__name__}: {e or '(no message)'}")
+        return hit[1] if hit else ""
+    text = (res.get('overview') or '').strip() if isinstance(res, dict) else ''
+    _en_overview[tmdb_id] = (time.time(), text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +434,12 @@ async def handle_request(request):
             item['title'] = item['Title'] = ru['t']
         if ru.get('o'):
             item['overview'] = item['Overview'] = ru['o']
+        # запасной вариант: русского описания нет — английское
+        if not (item.get('overview') or item.get('Overview') or '').strip():
+            en_o = await get_en_overview(str(tid))
+            if en_o:
+                item['overview'] = item['Overview'] = en_o
+                log(f"  [EN-FALLBACK] «{item.get('title', '?')}»: описание по-английски", level=1)
 
         poster_result = "—"
         if ru.get('p'):
